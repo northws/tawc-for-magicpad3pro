@@ -518,6 +518,9 @@ object NativeBridge {
         mainHandler.post {
             val activity = serviceRef?.get()?.getActivity(activityId) ?: return@post
             activity.setPointerIconFromCompositor(PointerIcon.getSystemIcon(activity, type))
+            // A relative pointer capture hides Android's cursor, so the
+            // overlay needs the shape too.
+            activity.setCursorShapeFromCompositor(shape)
         }
     }
 
@@ -550,6 +553,9 @@ object NativeBridge {
                 return@post
             }
             activity.setPointerIconFromCompositor(icon)
+            // The capture overlay cannot read a Bitmap back out of a
+            // PointerIcon, so hand it the sprite directly.
+            activity.setCursorBitmapFromCompositor(bitmap, hotspotX.toFloat(), hotspotY.toFloat())
         }
     }
 

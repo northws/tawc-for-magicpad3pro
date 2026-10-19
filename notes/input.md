@@ -114,8 +114,10 @@ before doing anything else:
 
 - `SOURCE_TOUCHSCREEN` and `SOURCE_STYLUS` -> `wl_touch`. Stylus stays on
   touch; a real `zwp_tablet_v2` path is out of scope.
-- `SOURCE_MOUSE` (which is also what Android reports for a touchpad driving a
-  cursor) -> `wl_pointer`.
+- `SOURCE_MOUSE` and `SOURCE_TOUCHPAD` -> `wl_pointer`. A touchpad that drives
+  the cursor reports `SOURCE_MOUSE` for its motion but delivers its scroll
+  gestures under `SOURCE_TOUCHPAD`; accepting only `SOURCE_MOUSE` drops
+  two-finger scrolling entirely.
 - Anything else (rotary encoders, gamepads) is ignored.
 
 Without the split a single click delivers both a `wl_touch.down` and a
@@ -134,6 +136,21 @@ map to evdev `BTN_LEFT` 0x110, `BTN_RIGHT` 0x111, `BTN_MIDDLE` 0x112,
 `BTN_SIDE` 0x113, `BTN_EXTRA` 0x114. A mouse side button also raises
 `KEYCODE_BACK`/`KEYCODE_FORWARD`; `TawcSurfaceView` swallows those so the
 click does not *also* run the Android Back policy below.
+
+**Relative pointer capture.** `TawcSurfaceView` requests a pointer capture
+while a `SOURCE_TOUCHPAD` device is attached and the window has focus
+(`onPointerCaptureChange` / `onCapturedPointerEvent`). A captured stream
+carries relative motion plus `AXIS_VSCROLL`/`AXIS_HSCROLL` without Android's
+event-source split, so touchpad scrolling reaches `wl_pointer.axis` even on
+devices whose `ACTION_SCROLL` would only be delivered under
+`SOURCE_TOUCHPAD`. Captured deltas are accumulated into a surface position
+(clamped to the view) and fed through the same `nativeOnPointerEvent` path;
+buttons use the same bitmask diff and scroll the same axis branch. Android
+stops drawing its own cursor while a capture is held, so `CursorOverlayView`
+draws the sprite — the client bitmap from `wl_pointer.set_cursor` when there
+is one, a built-in glyph for `wp_cursor_shape_v1` names otherwise. Losing the
+capture releases any held buttons so a client cannot be left with a stuck
+drag. A plain mouse is not captured and keeps Android's absolute cursor.
 
 **Scroll units and direction.** Android `AXIS_VSCROLL` is positive scrolling
 away from the user, Wayland's vertical axis is positive downward, so vertical

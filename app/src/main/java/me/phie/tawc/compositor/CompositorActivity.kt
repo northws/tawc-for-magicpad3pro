@@ -10,6 +10,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.hardware.display.DisplayManager
+import android.hardware.input.InputManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -66,7 +67,7 @@ import java.io.File
  */
 class CompositorActivity : Activity(), SurfaceHolder.Callback {
     private lateinit var rootView: FrameLayout
-    private lateinit var surfaceView: SurfaceView
+    private lateinit var surfaceView: TawcSurfaceView
 
     /** Last mouse button mask seen from a mouse-source MotionEvent. Android
      *  reports a bitmask rather than per-button actions, so press/release
@@ -92,6 +93,26 @@ class CompositorActivity : Activity(), SurfaceHolder.Callback {
     private val metadataScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private val taskIconCache = HashMap<String, Bitmap?>()
     private var taskMetadataVersion = 0
+
+    /** Draws the pointer sprite while [surfaceView] holds a relative pointer
+     *  capture. Android stops drawing its own cursor then. */
+    private var cursorOverlay: CursorOverlayView? = null
+
+    /** Re-evaluates pointer capture when a pointer device is plugged in or
+     *  removed (keyboard cases attach their touchpad after the window). */
+    private val inputDeviceListener = object : InputManager.InputDeviceListener {
+        override fun onInputDeviceAdded(deviceId: Int) {
+            if (initialized) surfaceView.updatePointerCapture()
+        }
+
+        override fun onInputDeviceRemoved(deviceId: Int) {
+            if (initialized) surfaceView.updatePointerCapture()
+        }
+
+        override fun onInputDeviceChanged(deviceId: Int) {
+            if (initialized) surfaceView.updatePointerCapture()
+        }
+    }
 
     private var compositorService: CompositorService? = null
     private var backCallback: Any? = null
@@ -160,10 +181,18 @@ class CompositorActivity : Activity(), SurfaceHolder.Callback {
         surfaceView.isFocusableInTouchMode = true
         surfaceView.requestFocus()
         surfaceView.setOnTouchListener { _, event -> dispatchTouchToCompositor(event) }
+        cursorOverlay = CursorOverlayView(this).also { overlay ->
+            rootView.addView(overlay, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT,
+            ))
+        }
         applyCompositorFullscreen(NativeBridge.fullscreenForActivity(activityId))
         registerBackCallback()
         getSystemService(DisplayManager::class.java)
             .registerDisplayListener(displayListener, Handler(Looper.getMainLooper()))
+        getSystemService(InputManager::class.java)
+            ?.registerInputDeviceListener(inputDeviceListener, Handler(Looper.getMainLooper()))
 
         initialized = true
         if (launch != null) showLaunchSplash(launch)
@@ -193,6 +222,7 @@ class CompositorActivity : Activity(), SurfaceHolder.Callback {
     override fun onDestroy() {
         if (initialized) {
             getSystemService(DisplayManager::class.java).unregisterDisplayListener(displayListener)
+            getSystemService(InputManager::class.java)?.unregisterInputDeviceListener(inputDeviceListener)
             surfaceView.removeCallbacks(scrollStopRunnable)
             unregisterBackCallback()
             metadataScope.cancel()
@@ -301,6 +331,7 @@ class CompositorActivity : Activity(), SurfaceHolder.Callback {
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
         if (!initialized) return
         NativeBridge.nativeOnActivitySurfaceChanged(activityId, width, height)
+        surfaceView.updatePointerCapture()
     }
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
@@ -320,9 +351,20 @@ class CompositorActivity : Activity(), SurfaceHolder.Callback {
         }
         compositorService?.setWindowFocused(activityId, hasFocus)
         NativeBridge.nativeOnActivityFocusChanged(activityId, hasFocus)
+        surfaceView.updatePointerCapture()
         if (hasFocus) {
             NativeBridge.replayPendingKeyboardForActivity(activityId, this)
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (initialized) surfaceView.updatePointerCapture()
+    }
+
+    override fun onPause() {
+        super.onPause()
+        if (initialized) surfaceView.releasePointerCaptureNow()
     }
 
     internal fun focusedInputConnectionForDev(): TawcInputConnection? {
@@ -534,9 +576,7 @@ class CompositorActivity : Activity(), SurfaceHolder.Callback {
         /** Wheel (`ACTION_SCROLL`) and mouse button press/release actions
          *  arrive here rather than through the touch listener. */
         override fun onGenericMotionEvent(event: MotionEvent): Boolean {
-            if (event.isFromSource(InputDevice.SOURCE_MOUSE) &&
-                dispatchPointerToCompositor(event)
-            ) {
+            if (isPointerSource(event) && dispatchPointerToCompositor(event)) {
                 return true
             }
             return super.onGenericMotionEvent(event)
@@ -546,12 +586,93 @@ class CompositorActivity : Activity(), SurfaceHolder.Callback {
          *  [onGenericMotionEvent] if this returns false, so hook it
          *  explicitly rather than relying on the fall-through. */
         override fun onHoverEvent(event: MotionEvent): Boolean {
-            if (event.isFromSource(InputDevice.SOURCE_MOUSE) &&
-                dispatchPointerToCompositor(event)
-            ) {
+            if (isPointerSource(event) && dispatchPointerToCompositor(event)) {
                 return true
             }
             return super.onHoverEvent(event)
+        }
+
+        // --- Relative pointer capture -------------------------------------
+        // A touchpad that drives the cursor reports SOURCE_MOUSE for its
+        // motion, but Android only delivers its scroll gesture as
+        // ACTION_SCROLL to the view it hovers, and that event is
+        // SOURCE_TOUCHPAD-sourced. Capturing the pointer sidesteps the
+        // source split entirely: the captured stream carries relative
+        // motion plus AXIS_VSCROLL/AXIS_HSCROLL for mice and touchpads
+        // alike. Android hides its cursor during a capture, so
+        // [cursorOverlay] draws the sprite the compositor pushed.
+        //
+        // Capture is requested only while a touchpad is attached, so a
+        // plain mouse keeps Android's absolute cursor and pointer icon.
+
+        private var pointerCaptured = false
+        private var capturedX = 0f
+        private var capturedY = 0f
+        private var hasCapturedPosition = false
+
+        private fun touchpadAttached(): Boolean {
+            val manager = context.getSystemService(InputManager::class.java) ?: return false
+            return manager.inputDeviceIds.any { id ->
+                val device = manager.getInputDevice(id) ?: return@any false
+                !device.isVirtual && device.supportsSource(InputDevice.SOURCE_TOUCHPAD)
+            }
+        }
+
+        /** Match the capture to the current devices and window focus. */
+        fun updatePointerCapture() {
+            val want = isAttachedToWindow && hasWindowFocus() && touchpadAttached()
+            if (want) {
+                if (!hasPointerCapture()) requestPointerCapture()
+            } else if (hasPointerCapture()) {
+                releasePointerCapture()
+            }
+        }
+
+        fun releasePointerCaptureNow() {
+            if (hasPointerCapture()) releasePointerCapture()
+        }
+
+        override fun onPointerCaptureChange(hasCapture: Boolean) {
+            super.onPointerCaptureChange(hasCapture)
+            pointerCaptured = hasCapture
+            Log.i(TAG, "relative pointer capture: $hasCapture")
+            if (hasCapture) {
+                capturedX = width / 2f
+                capturedY = height / 2f
+                hasCapturedPosition = true
+                cursorOverlay?.moveTo(capturedX, capturedY)
+                cursorOverlay?.show()
+                // Prime the client so its cursor state starts where the
+                // overlay drew it rather than at a stale position.
+                sendPointerMotionAt(capturedX, capturedY, SystemClock.uptimeMillis())
+            } else {
+                cursorOverlay?.hide()
+                releaseHeldButtons()
+            }
+        }
+
+        override fun onCapturedPointerEvent(event: MotionEvent): Boolean {
+            // Do not rely on onPointerCaptureChange having run first: some
+            // devices deliver the first captured event before the callback.
+            if (!pointerCaptured) {
+                pointerCaptured = true
+                cursorOverlay?.show()
+            }
+            if (!hasCapturedPosition) {
+                capturedX = width / 2f
+                capturedY = height / 2f
+                hasCapturedPosition = true
+            }
+            // Captured events carry deltas, not surface positions.
+            capturedX = (capturedX + event.x).coerceIn(0f, width.toFloat())
+            capturedY = (capturedY + event.y).coerceIn(0f, height.toFloat())
+            sendPointerMotionAt(capturedX, capturedY, event.eventTime)
+            syncMouseButtonsAt(event, event.buttonState, capturedX, capturedY)
+            // No-op when neither axis is present, so this also covers
+            // devices that fold scroll into ACTION_MOVE.
+            sendPointerScrollAt(event, capturedX, capturedY)
+            cursorOverlay?.moveTo(capturedX, capturedY)
+            return true
         }
 
         override fun onCheckIsTextEditor(): Boolean = true
@@ -579,14 +700,24 @@ class CompositorActivity : Activity(), SurfaceHolder.Callback {
         }
     }
 
+    /** Whether this event belongs to the pointer path. A touchpad that moves
+     *  the cursor advertises `SOURCE_MOUSE` for its motion, but Android
+     *  reports its scroll gestures (two-finger scroll) under
+     *  `SOURCE_TOUCHPAD`, so accepting only the former silently drops
+     *  touchpad scrolling. */
+    private fun isPointerSource(event: MotionEvent): Boolean =
+        event.isFromSource(InputDevice.SOURCE_MOUSE) ||
+            event.isFromSource(InputDevice.SOURCE_TOUCHPAD)
+
     private fun dispatchTouchToCompositor(event: MotionEvent): Boolean {
         // Source split. A mouse click reaches the touch listener as
         // ACTION_DOWN/MOVE/UP, so without this a single click would deliver
         // both a wl_touch.down and a wl_pointer.button and clients would
-        // double-handle it. Stylus deliberately stays on touch — a real
-        // zwp_tablet_v2 path is out of scope. Anything else (rotary
-        // encoders, gamepads) is not ours.
-        if (event.isFromSource(InputDevice.SOURCE_MOUSE)) {
+        // double-handle it. Touchpad taps take the same route: their action
+        // events are pointer input, not wl_touch. Stylus deliberately stays
+        // on touch — a real zwp_tablet_v2 path is out of scope. Anything
+        // else (rotary encoders, gamepads) is not ours.
+        if (isPointerSource(event)) {
             return dispatchPointerToCompositor(event)
         }
         if (!event.isFromSource(InputDevice.SOURCE_TOUCHSCREEN) &&
@@ -631,10 +762,22 @@ class CompositorActivity : Activity(), SurfaceHolder.Callback {
     }
 
     /** Apply a cursor the compositor derived from the client's cursor
-     *  request. Android draws the sprite; TAWC never renders one itself. */
+     *  request. Android draws the sprite itself, except while a relative
+     *  pointer capture is active — the overlay takes over then. */
     fun setPointerIconFromCompositor(icon: PointerIcon) {
         if (!initialized) return
         surfaceView.pointerIcon = icon
+    }
+
+    /** Cursor shape pushed by the compositor, for the capture overlay. */
+    fun setCursorShapeFromCompositor(shape: String) {
+        cursorOverlay?.setShape(shape)
+    }
+
+    /** Client-drawn cursor bitmap (`wl_pointer.set_cursor`), for the
+     *  capture overlay (the overlay cannot read a `PointerIcon` back). */
+    fun setCursorBitmapFromCompositor(bitmap: Bitmap, hotspotX: Float, hotspotY: Float) {
+        cursorOverlay?.setClientBitmap(bitmap, hotspotX, hotspotY)
     }
 
     /**
@@ -688,14 +831,25 @@ class CompositorActivity : Activity(), SurfaceHolder.Callback {
     }
 
     private fun sendPointerMotion(event: MotionEvent) {
+        sendPointerMotionAt(event.x, event.y, event.eventTime)
+    }
+
+    /** Pointer motion at an explicit surface position. Captured pointer
+     *  events carry deltas, so [TawcSurfaceView.onCapturedPointerEvent]
+     *  accumulates its own position and passes it here. */
+    private fun sendPointerMotionAt(x: Float, y: Float, time: Long) {
         NativeBridge.nativeOnPointerEvent(
-            activityId, POINTER_KIND_MOTION, event.x, event.y,
-            0, false, 0f, 0f, false, false, event.eventTime,
+            activityId, POINTER_KIND_MOTION, x, y,
+            0, false, 0f, 0f, false, false, time,
         )
     }
 
     /** Emit one button event per bit that changed since the last event. */
     private fun syncMouseButtons(event: MotionEvent, rawMask: Int) {
+        syncMouseButtonsAt(event, rawMask, event.x, event.y)
+    }
+
+    private fun syncMouseButtonsAt(event: MotionEvent, rawMask: Int, x: Float, y: Float) {
         val mask = rawMask and MOUSE_BUTTON_MASK
         var changed = mask xor mouseButtonState
         if (changed == 0) return
@@ -704,13 +858,34 @@ class CompositorActivity : Activity(), SurfaceHolder.Callback {
             val bit = changed and -changed
             changed = changed and bit.inv()
             NativeBridge.nativeOnPointerEvent(
-                activityId, POINTER_KIND_BUTTON, event.x, event.y,
+                activityId, POINTER_KIND_BUTTON, x, y,
                 bit, (mask and bit) != 0, 0f, 0f, false, false, event.eventTime,
             )
         }
     }
 
+    /** Release anything still held when a capture ends under us (focus loss,
+     *  window teardown); otherwise the client keeps the button down. */
+    private fun releaseHeldButtons() {
+        if (mouseButtonState == 0) return
+        var remaining = mouseButtonState
+        mouseButtonState = 0
+        val time = SystemClock.uptimeMillis()
+        while (remaining != 0) {
+            val bit = remaining and -remaining
+            remaining = remaining and bit.inv()
+            NativeBridge.nativeOnPointerEvent(
+                activityId, POINTER_KIND_BUTTON, 0f, 0f,
+                bit, false, 0f, 0f, false, false, time,
+            )
+        }
+    }
+
     private fun sendPointerScroll(event: MotionEvent) {
+        sendPointerScrollAt(event, event.x, event.y)
+    }
+
+    private fun sendPointerScrollAt(event: MotionEvent, x: Float, y: Float) {
         val vscroll = event.getAxisValue(MotionEvent.AXIS_VSCROLL)
         val hscroll = event.getAxisValue(MotionEvent.AXIS_HSCROLL)
         if (vscroll == 0f && hscroll == 0f) return
@@ -719,7 +894,7 @@ class CompositorActivity : Activity(), SurfaceHolder.Callback {
         // Android has no gesture-end event, so time it out.
         val fromTouchpad = event.device?.supportsSource(InputDevice.SOURCE_TOUCHPAD) == true
         NativeBridge.nativeOnPointerEvent(
-            activityId, POINTER_KIND_AXIS, event.x, event.y,
+            activityId, POINTER_KIND_AXIS, x, y,
             0, false, vscroll, hscroll, fromTouchpad, false, event.eventTime,
         )
         surfaceView.removeCallbacks(scrollStopRunnable)
