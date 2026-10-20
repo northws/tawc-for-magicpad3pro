@@ -1198,9 +1198,17 @@ pub fn show_keyboard_from_native(activity_id: &str) {
     });
 }
 
+/// Master switch for the on-device diagnostic toasts (Wayland input method,
+/// wlegl/AHB import, buffer kind, render elements). Off in shipped builds:
+/// the hooks stay compiled in and are re-enabled for debugging.
+const DIAG_TOASTS: bool = false;
+
 /// Reverse-JNI: show a short Android toast. Diagnostics for features whose
 /// logs only exist in logcat (the Wayland input method, for now).
 pub fn toast_from_native(message: &str) {
+    if !DIAG_TOASTS {
+        return;
+    }
     with_native_bridge("onToast", |env, class| {
         let jmsg = env.new_string(message)?;
         env.call_static_method(
