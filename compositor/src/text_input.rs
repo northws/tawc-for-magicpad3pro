@@ -185,6 +185,11 @@ struct InstanceState {
     content_hint: u32,
     content_purpose: u32,
 
+    /// Pending (`set_cursor_rectangle`) and committed cursor rectangle in
+    /// surface-local logical coordinates: (x, y, width, height).
+    pending_cursor_rect: Option<(i32, i32, i32, i32)>,
+    cursor_rect: Option<(i32, i32, i32, i32)>,
+
     /// Last preedit text we sent to this client. Needed so finishComposingText
     /// can commit the composing text rather than discarding it.
     current_preedit: Option<String>,
@@ -268,6 +273,12 @@ impl TextInputState {
         }
     }
 
+    pub fn set_pending_cursor_rect(&mut self, id: &ObjectId, x: i32, y: i32, w: i32, h: i32) {
+        if let Some(state) = self.instance_state.get_mut(id) {
+            state.pending_cursor_rect = Some((x, y, w, h));
+        }
+    }
+
     pub fn set_pending_change_cause(&mut self, id: &ObjectId, cause: u32) {
         if let Some(state) = self.instance_state.get_mut(id) {
             // Protocol enum: 0 = input_method, 1 = other
@@ -321,6 +332,10 @@ impl TextInputState {
         // above produced).
         state.content_hint = state.pending_content_hint;
         state.content_purpose = state.pending_content_purpose;
+
+        // Cursor rectangle drives where an input method's candidate popup
+        // is drawn; clear it when the client stops reporting one.
+        state.cursor_rect = state.pending_cursor_rect.take();
 
         // Apply pending surrounding text.
         let change_cause = state.pending_change_cause;
@@ -445,7 +460,7 @@ impl TextInputState {
         }
     }
 
-    fn focused_instance_enabled(&self) -> bool {
+    pub fn focused_instance_enabled(&self) -> bool {
         let focused_client = match &self.focused_surface {
             Some(s) => s.id(),
             None => return false,
@@ -463,7 +478,9 @@ impl TextInputState {
     /// The target Activity is part of the state so focus changes between
     /// Android tasks retarget the IME even when text-input remains enabled.
     fn sync_keyboard_target(&mut self, focused_activity_id: Option<&ActivityId>) {
-        let desired = if self.focused_instance_enabled() {
+        // A Wayland input method owns text input while it is active: keep
+        // Android's soft keyboard out of the way.
+        let desired = if self.focused_instance_enabled() && !crate::ime::wayland_ime_active() {
             focused_activity_id.cloned()
         } else {
             None
@@ -541,6 +558,124 @@ impl TextInputState {
             self.enter(new);
         }
         self.sync_keyboard_target(focused_activity_id);
+    }
+
+    /// Surrounding text of the focused client, in UTF-8 byte offsets.
+    /// Handed to a Wayland input method so it can place its candidate
+    /// window and reason about the text around the cursor.
+    pub fn focused_surrounding(&self) -> Option<(String, i32, i32)> {
+        let surface = self.focused_surface.as_ref()?;
+        for ti in &self.instances {
+            if !ti.id().same_client_as(&surface.id()) {
+                continue;
+            }
+            let inst = self.instance_state.get(&ti.id())?;
+            let s = inst.surrounding.as_ref()?;
+            return Some((s.text.clone(), s.cursor as i32, s.anchor as i32));
+        }
+        None
+    }
+
+    /// `(hint, purpose)` of the focused client's enabled text input.
+    pub fn focused_content_type(&self) -> Option<(u32, u32)> {
+        let surface = self.focused_surface.as_ref()?;
+        for ti in &self.instances {
+            if !ti.id().same_client_as(&surface.id()) {
+                continue;
+            }
+            let inst = self.instance_state.get(&ti.id())?;
+            if !inst.enabled {
+                continue;
+            }
+            return Some((inst.content_hint, inst.content_purpose));
+        }
+        None
+    }
+
+    /// Hide Android's soft keyboard and stop tracking it as shown. Called
+    /// when a Wayland input method activates.
+    pub fn drop_android_keyboard(&mut self) {
+        if let Some(activity_id) = self.keyboard_target.take() {
+            hide_keyboard(&activity_id);
+        }
+    }
+
+    /// Cursor rectangle of the focused client's enabled text input, in
+    /// surface-local logical coordinates.
+    pub fn focused_cursor_rect(&self) -> Option<(i32, i32, i32, i32)> {
+        let surface = self.focused_surface.as_ref()?;
+        for ti in &self.instances {
+            if !ti.id().same_client_as(&surface.id()) {
+                continue;
+            }
+            let inst = self.instance_state.get(&ti.id())?;
+            if !inst.enabled {
+                continue;
+            }
+            return inst.cursor_rect;
+        }
+        None
+    }
+
+    /// Handle a text batch from a Wayland input method (`zwp_input_method_v2`).
+    /// Unlike [`Self::handle_android_event`], lengths are already UTF-8 bytes,
+    /// so no UTF-16 conversion is involved, and nothing is mirrored back into
+    /// Android's `Editable`.
+    pub fn handle_ime_text(
+        &mut self,
+        preedit: Option<(String, i32, i32)>,
+        commit: Option<String>,
+        delete_before: u32,
+        delete_after: u32,
+    ) -> bool {
+        let mut delivered = false;
+        let surface = match &self.focused_surface {
+            Some(s) => s,
+            None => return false,
+        };
+
+        for ti in &self.instances {
+            if !ti.id().same_client_as(&surface.id()) {
+                continue;
+            }
+            let inst = match self.instance_state.get_mut(&ti.id()) {
+                Some(s) => s,
+                None => continue,
+            };
+            if !inst.enabled {
+                continue;
+            }
+
+            // Same ordering the Android path uses: clear the old preedit
+            // first, then delete surrounding text, then insert the commit
+            // string, and finally install the new preedit. Clients apply the
+            // done-batch in this order, and GTK keeps drawing a stale preedit
+            // if it is cleared only after the commit.
+            if commit.is_some() && inst.current_preedit.is_some() {
+                ti.preedit_string(None, 0, 0);
+                inst.current_preedit = None;
+            }
+            if delete_before > 0 || delete_after > 0 {
+                ti.delete_surrounding_text(delete_before, delete_after);
+            }
+            if let Some(text) = &commit {
+                ti.commit_string(Some(text.clone()));
+                inst.current_preedit = None;
+            }
+            if let Some((text, cursor_begin, cursor_end)) = &preedit {
+                if text.is_empty() {
+                    ti.preedit_string(None, 0, 0);
+                    inst.current_preedit = None;
+                } else {
+                    ti.preedit_string(Some(text.clone()), *cursor_begin, *cursor_end);
+                    inst.current_preedit = Some(text.clone());
+                }
+            }
+
+            ti.done(inst.commit_count);
+            delivered = true;
+        }
+        delivered
     }
 
     // --- Android IME event handling ---
@@ -947,7 +1082,9 @@ impl Dispatch<ZwpTextInputV3, TextInputData> for TawcState {
             zwp_text_input_v3::Request::SetContentType { hint, purpose } => {
                 state.text_input_state.set_pending_content_type(&id, hint.into(), purpose.into());
             }
-            zwp_text_input_v3::Request::SetCursorRectangle { .. } => {}
+            zwp_text_input_v3::Request::SetCursorRectangle { x, y, width, height } => {
+                state.text_input_state.set_pending_cursor_rect(&id, x, y, width, height);
+            }
             zwp_text_input_v3::Request::Commit => {
                 let focused_activity_id = state
                     .text_input_state
@@ -955,6 +1092,9 @@ impl Dispatch<ZwpTextInputV3, TextInputData> for TawcState {
                     .as_ref()
                     .and_then(|surface| state.desktop.host_for_surface(surface));
                 state.text_input_state.commit(&id, focused_activity_id.as_ref());
+                // Clients enable text input *after* focus, so activation has
+                // to be re-evaluated here too, not only on focus moves.
+                crate::ime::text_focus_changed(state);
             }
             zwp_text_input_v3::Request::Destroy => {
                 let focused_activity_id = state

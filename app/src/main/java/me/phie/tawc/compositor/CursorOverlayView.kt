@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package me.phie.tawc.compositor
 
 import android.content.Context

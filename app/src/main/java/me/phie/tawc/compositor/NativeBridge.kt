@@ -10,6 +10,7 @@ import android.util.Log
 import android.view.PointerIcon
 import android.view.Surface
 import android.view.inputmethod.EditorInfo
+import android.widget.Toast
 import androidx.core.net.toUri
 import me.phie.tawc.launcher.LaunchEvent
 import me.phie.tawc.launcher.LaunchRegistry
@@ -512,6 +513,16 @@ object NativeBridge {
      * rendering a second cursor into the Wayland scene. `View.setPointerIcon`
      * must run on the UI thread.
      */
+    /** Reverse-JNI diagnostic toast, used while the Wayland input-method
+     *  integration is being brought up on devices without logcat access. */
+    @JvmStatic
+    fun onToast(message: String) {
+        mainHandler.post {
+            val context = serviceRef?.get() ?: return@post
+            Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
+        }
+    }
+
     @JvmStatic
     fun setPointerIcon(activityId: String, shape: String) {
         val type = pointerIconTypeFor(shape)

@@ -29,13 +29,14 @@ use smithay::backend::renderer::{buffer_type, Bind, BufferType, Color32F, Frame,
 use smithay::backend::renderer::utils::{
     draw_render_elements, CommitCounter, DamageSet, OpaqueRegions,
 };
+use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::protocol::{wl_buffer::WlBuffer, wl_surface::WlSurface};
 use smithay::desktop::utils::OutputPresentationFeedback;
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::Monotonic;
 use smithay::wayland::presentation::Refresh;
 use wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
-use smithay::utils::{Buffer as BufferCoord, Physical, Rectangle, Scale, Size, Transform};
+use smithay::utils::{Buffer as BufferCoord, Physical, Point, Rectangle, Scale, Size, Transform};
 
 use crate::compositor::TawcState;
 use crate::egl_android::AndroidNativeSurface;
@@ -695,8 +696,23 @@ pub fn render_frame(
     let tint_enabled = TINT_BUFFERS_BY_TYPE.load(Ordering::Relaxed);
     // Front to back, as `draw_render_elements` expects.
     let mut elements: Vec<TawcRenderElement> = Vec::new();
+    let mut popup_placement: Option<crate::placement::Placement> = None;
+    let mut frontmost_placement: Option<crate::placement::Placement> = None;
     if let Some(space) = state.desktop.host_space(&host.activity_id) {
         let layout = Layout::new(space, Size::from(host.logical_size));
+        frontmost_placement = layout.entries.last().map(|entry| entry.placement);
+        if let Some(focus) = state.text_input_state.focused_surface.as_ref() {
+            popup_placement = layout
+                .entries
+                .iter()
+                .find(|entry| {
+                    entry
+                        .window
+                        .toplevel()
+                        .is_some_and(|toplevel| toplevel.wl_surface() == focus)
+                })
+                .map(|entry| entry.placement);
+        }
         for (i, entry) in layout.entries.iter().enumerate().rev() {
             let placement = entry.placement;
             let location = placement.offset.to_physical(scale.fractional()).to_i32_round();
@@ -727,6 +743,66 @@ pub fn render_frame(
                 )));
             }
         }
+    }
+
+    // Input-method candidate window: drawn above every window, positioned at
+    // the focused client's cursor rectangle. The surface belongs to the IM
+    // client (fcitx5), not to a desktop window, so it is rendered directly
+    // rather than through the space.
+    //
+    // Isolation switch: rendering the popup is the newest path and is being
+    // A/B tested against a Firefox stall.
+    const RENDER_IME_POPUP: bool = true;
+    if RENDER_IME_POPUP {
+    if let (Some(popup), Some(placement)) = (
+        state.ime.popup_surface.clone(),
+        popup_placement.or(frontmost_placement),
+    ) {
+        // The IM may destroy and recreate its popup surface at any time.
+        if !popup.is_alive() {
+            // fall through: nothing to draw this frame
+        } else {
+        let window_scale = placement.scale;
+        // Prefer the text cursor rectangle the client reported; fall back to
+        // the pointer position when it never sent one (some toolkits only
+        // send it once typing starts).
+        let logical = match state.text_input_state.focused_cursor_rect() {
+            // Anchor the candidate window just below the text caret: putting
+            // it at the caret's top-left covers the input field itself.
+            Some((x, y, _, h)) => {
+                placement.offset
+                    + Point::from((
+                        x as f64 * window_scale,
+                        (y + h) as f64 * window_scale,
+                    ))
+            }
+            None => state.pointer_screen_location,
+        };
+        let physical: Point<i32, Physical> = logical.to_physical(scale.fractional()).to_i32_round();
+        let location = Point::<f64, Physical>::from((physical.x as f64, physical.y as f64));
+        let element = smithay::wayland::compositor::with_states(&popup, |states| {
+            WaylandSurfaceRenderElement::<GlesRenderer>::from_surface(
+                &mut render.renderer,
+                &popup,
+                states,
+                location,
+                1.0,
+                RenderElementKind::Unspecified,
+            )
+        });
+        match element {
+            Ok(Some(element)) => {
+                // No debug tint: the candidate window is IM chrome, not a
+                // client buffer whose backend we are diagnosing.
+                let wrapped =
+                    wrap_wayland_render_element(element, window_scale, plain_shader, tint_shader, false);
+                elements.insert(0, TawcRenderElement::Wayland(wrapped));
+            }
+            Ok(None) => {}
+            Err(err) => info!("input popup element unavailable: {err:?}"),
+        }
+        }
+    }
     }
 
     let mut target = render.renderer.bind(egl_surface)?;
@@ -760,6 +836,21 @@ pub fn send_frame_callbacks(state: &TawcState, time: Duration) {
     let Some(visible_space) = state.desktop.visible_space(&state.hosts) else {
         return;
     };
+
+    // The input method's candidate window is not part of the space, so it
+    // would never get a frame callback and fcitx would stop repainting it
+    // after the first frame.
+    if let Some(popup) = state.ime.popup_surface.as_ref() {
+        smithay::desktop::utils::send_frames_surface_tree(
+            popup,
+            output,
+            time,
+            None,
+            |_: &WlSurface, _: &smithay::wayland::compositor::SurfaceData| {
+                Some(output.clone())
+            },
+        );
+    }
 
     for window in visible_space.elements() {
         window.send_frame(

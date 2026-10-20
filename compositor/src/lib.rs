@@ -41,6 +41,7 @@ mod keymap;
 mod launch;
 mod launch_match;
 mod icon_cache;
+mod ime;
 mod launcher;
 mod text_input;
 mod vsync;
@@ -1192,6 +1193,21 @@ pub fn show_keyboard_from_native(activity_id: &str) {
             "onShowKeyboard",
             "(Ljava/lang/String;)V",
             &[(&activity_jstr).into()],
+        )?;
+        Ok(())
+    });
+}
+
+/// Reverse-JNI: show a short Android toast. Diagnostics for features whose
+/// logs only exist in logcat (the Wayland input method, for now).
+pub fn toast_from_native(message: &str) {
+    with_native_bridge("onToast", |env, class| {
+        let jmsg = env.new_string(message)?;
+        env.call_static_method(
+            class,
+            "onToast",
+            "(Ljava/lang/String;)V",
+            &[(&jmsg).into()],
         )?;
         Ok(())
     });

@@ -373,3 +373,34 @@ There is intentionally **no test infra that pokes `NativeBridge.native*` directl
 The sanctioned middle-of-the-stack test toggle is `test-init`, which every integration test calls before doing work. It swaps `NativeBridge.imeOutput` to a fresh `RecordingImeOutput`, resets `Settings` to an in-memory factory-default store, clears the active IC, and asks attached Wayland/XWayland client windows to close. If it had to close anything, the Rust harness waits for the compositor to report zero clients/toplevels before the test continues. That's not bypassing anything in our state machine — it removes the *third-party* system IME (Gboard / OpenBoard / AOSP-latin) at the boundary so it doesn't react to our `updateSelection` calls and amplify them back into the IC. The recorder still creates and owns a test `TawcInputConnection` when the compositor requests keyboard show/restart, and tests wait for `input-ready` before driving `ic-*` actions. The special `ic-finish-hidden-composing` action exists only to model stale IME callbacks after keyboard hide/focus leave; normal input actions never target hidden ICs. Process death reverts the swap and discards in-memory settings, so test crashes can't persist test state across app launches.
 
 See `notes/exec-broker.md` "Registered actions" for the full action surface and `app/src/debug/java/me/phie/tawc/dev/InputActions.kt` for handler implementations.
+
+## Wayland input method (`zwp_input_method_v2`)
+
+Android's IME is not the only source of text: a Wayland input method client
+running inside the chroot — fcitx5 — can compose with the physical keyboard.
+`compositor/src/ime.rs` implements the compositor side:
+
+- Globals: `zwp_input_method_manager_v2` (custom dispatch) and
+  `zwp_virtual_keyboard_v1` (Smithay's `VirtualKeyboardManagerState`, which
+  injects keys straight into the focused client's `wl_keyboard`).
+- Focus: `TawcState::set_input_focus` and every text-input `commit` call
+  `ime::text_focus_changed`, which emits `activate` / `deactivate` edges plus
+  `surrounding_text` / `content_type` / `done`. Activate is edge-triggered —
+  resending it per keystroke would reset fcitx's composition.
+- Keyboard: when the IM sends `grab_keyboard`, the compositor installs a
+  Smithay `KeyboardGrab` that forwards every key event (and modifier
+  changes) to the IM's grab object, after sending it the seat keymap and
+  repeat info. The grab is released when the grab object or the whole input
+  method goes away, so a dying IM can't swallow the keyboard.
+- Text: `commit_string` / `set_preedit_string` / `delete_surrounding_text`
+  are batched until `zwp_input_method_v2.commit`, then applied to the focused
+  client's text-input with byte offsets (no Android UTF-16 translation) via
+  `TextInputState::handle_ime_text`.
+- Candidate window: `get_input_popup_surface` stores the IM's surface; the
+  renderer draws it above every window at the focused client's cursor
+  rectangle (falling back to the pointer), and feeds it frame callbacks
+  because it is not part of the desktop space.
+
+Setup on the device: install `fcitx5` + `fcitx5-chinese-addons` in the
+chroot, add a `pinyin` group to `~/.config/fcitx5/profile`, and run
+`fcitx5 -d` inside a tawc session so it connects to TAWC's Wayland socket.

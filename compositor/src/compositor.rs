@@ -69,6 +69,8 @@ use smithay::wayland::cursor_shape::CursorShapeManagerState;
 use smithay::wayland::tablet_manager::TabletSeatHandler;
 use smithay::wayland::presentation::PresentationState;
 use smithay::wayland::viewporter::ViewporterState;
+use smithay::wayland::virtual_keyboard::VirtualKeyboardManagerState;
+use smithay::reexports::wayland_protocols_misc::zwp_input_method_v2::server::zwp_input_method_manager_v2::ZwpInputMethodManagerV2;
 use smithay::wayland::xdg_activation::{
     XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData,
 };
@@ -246,6 +248,10 @@ pub struct TawcState {
     /// Text input protocol state.
     pub text_input_state: TextInputState,
 
+    /// Wayland input method (zwp_input_method_v2) state. Lets a fcitx5
+    /// running inside the chroot compose for the focused client.
+    pub ime: crate::ime::ImeState,
+
     /// In-flight mirror of a client-owned clipboard selection into
     /// Android. A newer selection (or fresh Android clipboard text)
     /// cancels and replaces it; see clipboard.rs.
@@ -408,6 +414,8 @@ impl TawcState {
 
         dh.create_global::<Self, AndroidWlegl, ()>(2, ());
         dh.create_global::<Self, ZwpTextInputManagerV3, ()>(1, ());
+        dh.create_global::<Self, ZwpInputMethodManagerV2, ()>(1, ());
+        VirtualKeyboardManagerState::new::<Self, _>(&dh, |_| true);
         // gfxstream-bridge custom Vulkan WSI. Disabled builds do not
         // advertise the protocol or link the gfxstream backend.
         #[cfg(feature = "gfxstream")]
@@ -446,6 +454,7 @@ impl TawcState {
             output_logical_size: (0, 0),
             output_physical_size: (0, 0),
             text_input_state: TextInputState::new(),
+            ime: crate::ime::ImeState::new(),
             clipboard_pull: None,
             last_announced_android_clip_ts: None,
             selection_mirrored: false,
@@ -620,6 +629,7 @@ impl TawcState {
         }
         let target_activity_id = target.and_then(|surface| self.desktop.host_for_surface(surface));
         self.text_input_state.update_focus(target, target_activity_id.as_ref());
+        crate::ime::text_focus_changed(self);
     }
 
     /// Advertise the current scale to one surface through both scale paths:
