@@ -12,7 +12,7 @@
 //! The AHardwareBuffer / gralloc4 mapper path is explicitly avoided because
 //! its private_handle_t format differs on modern devices.
 
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::ptr;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -34,6 +34,7 @@ use crate::gl_import::AhbTextureImporter;
 use crate::protocol::android_wlegl::server::{
     android_wlegl::{self, AndroidWlegl},
     android_wlegl_handle::{self, AndroidWleglHandle},
+    android_wlegl_server_buffer_handle::{self, AndroidWleglServerBufferHandle},
 };
 
 // ---------------------------------------------------------------------------
@@ -58,6 +59,21 @@ unsafe extern "C" {
     ) -> *mut ndk_sys::AHardwareBuffer;
 
     fn tawc_wlegl_buffer_release(ahb: *mut ndk_sys::AHardwareBuffer);
+
+    /// Allocate an AHardwareBuffer on behalf of a client (server-side
+    /// android_wlegl buffer). Fills dup'd fds, ints and stride; the returned
+    /// AHB is owned by the caller.
+    fn tawc_wlegl_allocate(
+        width: u32,
+        height: u32,
+        format: u32,
+        usage: u64,
+        out_stride: *mut i32,
+        out_fds: *mut RawFd,
+        out_ints: *mut i32,
+        out_num_fds: *mut i32,
+        out_num_ints: *mut i32,
+    ) -> *mut ndk_sys::AHardwareBuffer;
 }
 
 // ---------------------------------------------------------------------------
@@ -424,13 +440,94 @@ impl Dispatch<AndroidWlegl, ()> for TawcState {
                 };
                 data_init.init(id, ExternalBufferData::new(data));
             }
-            android_wlegl::Request::GetServerBufferHandle { .. } => {
-                resource.post_error(
-                    android_wlegl::Error::BadValue,
-                    "server-side buffer allocation is not supported",
-                );
+            android_wlegl::Request::GetServerBufferHandle {
+                id,
+                width,
+                height,
+                format,
+                usage,
+            } => {
+                // Server-side allocation, as used by Mesa's arlinux WSI
+                // (Turnip + zink presentation): the compositor owns gralloc
+                // allocation and hands the client a ready-to-import buffer.
+                let Some(importer) = state.render.get().map(|r| r.importer) else {
+                    resource.post_error(android_wlegl::Error::BadValue, "renderer unavailable");
+                    return;
+                };
+                let mut fds = [0 as RawFd; 16];
+                let mut ints = [0i32; 64];
+                let mut num_fds = 0i32;
+                let mut num_ints = 0i32;
+                let mut stride = 0i32;
+                let ahb = unsafe {
+                    tawc_wlegl_allocate(
+                        width as u32,
+                        height as u32,
+                        format as u32,
+                        (usage as u32) as u64,
+                        &mut stride,
+                        fds.as_mut_ptr(),
+                        ints.as_mut_ptr(),
+                        &mut num_fds,
+                        &mut num_ints,
+                    )
+                };
+                if ahb.is_null()
+                    || num_fds < 0
+                    || num_ints < 0
+                    || num_fds as usize > fds.len()
+                    || num_ints as usize > ints.len()
+                {
+                    resource.post_error(
+                        android_wlegl::Error::BadValue,
+                        "server buffer allocation failed",
+                    );
+                    return;
+                }
+
+                let handle = data_init.init(id, ());
+                for i in 0..num_fds as usize {
+                    let fd = unsafe { OwnedFd::from_raw_fd(fds[i]) };
+                    handle.buffer_fd(fd.as_fd());
+                }
+                let ints_bytes: Vec<u8> = ints[..num_ints as usize]
+                    .iter()
+                    .flat_map(|v| v.to_ne_bytes())
+                    .collect();
+                handle.buffer_ints(ints_bytes);
+
+                let data = WleglBufferData {
+                    ahb,
+                    width,
+                    height,
+                    has_alpha: android_format_has_alpha(format as u32),
+                    origin: BufferOrigin::Hybris,
+                    importer,
+                    texture: Mutex::new(None),
+                };
+                let wl_buffer: WlBuffer = _client
+                    .create_resource::<WlBuffer, ExternalBufferData, TawcState>(
+                        _dhandle,
+                        1,
+                        ExternalBufferData::new(data),
+                    )
+                    .expect("create server wl_buffer");
+                handle.buffer(&wl_buffer, format, stride);
             }
         }
+    }
+}
+
+impl Dispatch<AndroidWleglServerBufferHandle, ()> for TawcState {
+    fn request(
+        _state: &mut Self,
+        _client: &Client,
+        _resource: &AndroidWleglServerBufferHandle,
+        _request: android_wlegl_server_buffer_handle::Request,
+        _data: &(),
+        _dhandle: &DisplayHandle,
+        _data_init: &mut DataInit<'_, Self>,
+    ) {
     }
 }
 

@@ -48,6 +48,9 @@ typedef int (*fn_create_from_handle_t)(
 static pthread_once_t          g_once = PTHREAD_ONCE_INIT;
 static fn_create_from_handle_t g_create_from_handle;
 static void                  (*g_release)(AHardwareBuffer *);
+static int                   (*g_allocate)(const AHardwareBuffer_Desc *, AHardwareBuffer **);
+static void                  (*g_describe)(const AHardwareBuffer *, AHardwareBuffer_Desc *);
+static const struct tawc_native_handle *(*g_get_native_handle)(const AHardwareBuffer *);
 
 static void load_symbols(void) {
     void *lib = dlopen("libnativewindow.so", RTLD_NOW | RTLD_GLOBAL);
@@ -59,6 +62,12 @@ static void load_symbols(void) {
         dlsym(lib, "AHardwareBuffer_createFromHandle");
     g_release = (void (*)(AHardwareBuffer *))
         dlsym(lib, "AHardwareBuffer_release");
+    g_allocate = (int (*)(const AHardwareBuffer_Desc *, AHardwareBuffer **))
+        dlsym(lib, "AHardwareBuffer_allocate");
+    g_describe = (void (*)(const AHardwareBuffer *, AHardwareBuffer_Desc *))
+        dlsym(lib, "AHardwareBuffer_describe");
+    g_get_native_handle = (const struct tawc_native_handle *(*)(const AHardwareBuffer *))
+        dlsym(lib, "AHardwareBuffer_getNativeHandle");
     if (!g_create_from_handle || !g_release) {
         LOGE("dlsym AHardwareBuffer_* failed (createFromHandle=%p release=%p)",
              g_create_from_handle, g_release);
@@ -135,4 +144,49 @@ void tawc_wlegl_buffer_release(AHardwareBuffer *ahb) {
     if (!ahb) return;
     pthread_once(&g_once, load_symbols);
     if (g_release) g_release(ahb);
+}
+
+// Server-side allocation for android_wlegl.get_server_buffer_handle: allocate
+// an AHardwareBuffer, dup its native_handle fds and copy its ints so they can
+// be sent to the client over Wayland. Returns the AHB (owned by the caller,
+// released with tawc_wlegl_buffer_release) or NULL.
+AHardwareBuffer *tawc_wlegl_allocate(
+    uint32_t width, uint32_t height, uint32_t format, uint64_t usage,
+    int32_t *out_stride,
+    int *out_fds, int32_t *out_ints,
+    int *out_num_fds, int *out_num_ints)
+{
+    pthread_once(&g_once, load_symbols);
+    if (!g_allocate || !g_describe || !g_get_native_handle) return NULL;
+
+    AHardwareBuffer_Desc desc = {0};
+    desc.width = width;
+    desc.height = height;
+    desc.layers = 1;
+    desc.format = format;
+    desc.usage = usage;
+    desc.stride = 0;
+
+    AHardwareBuffer *ahb = NULL;
+    if (g_allocate(&desc, &ahb) != 0 || !ahb) {
+        LOGE("tawc_wlegl_allocate: allocate %ux%u fmt=%u usage=%llx failed",
+             width, height, format, (unsigned long long)usage);
+        return NULL;
+    }
+
+    AHardwareBuffer_Desc actual = {0};
+    g_describe(ahb, &actual);
+    *out_stride = (int32_t)actual.stride;
+
+    const struct tawc_native_handle *h = g_get_native_handle(ahb);
+    if (!h || h->numFds < 0 || h->numInts < 0) {
+        LOGE("tawc_wlegl_allocate: no native handle");
+        g_release(ahb);
+        return NULL;
+    }
+    for (int i = 0; i < h->numFds; i++) out_fds[i] = dup(h->data[i]);
+    for (int i = 0; i < h->numInts; i++) out_ints[i] = h->data[h->numFds + i];
+    *out_num_fds = h->numFds;
+    *out_num_ints = h->numInts;
+    return ahb;
 }

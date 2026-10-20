@@ -122,6 +122,15 @@
           <arg name="format" type="int"/>
           <arg name="stride" type="int"/>
       </event>
+      <event name="buffer_linear_layout" since="2">
+          <description summary="linear layout attestation">
+              Sent after `buffer` when the compositor can attest the buffer's
+              actual layout (format and byte stride), so clients that must
+              import the handle with a linear layout can validate it.
+          </description>
+          <arg name="format" type="uint"/>
+          <arg name="stride" type="uint"/>
+      </event>
   </interface>
 
 </protocol>
