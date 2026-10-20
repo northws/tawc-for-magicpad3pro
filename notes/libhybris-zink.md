@@ -1,17 +1,55 @@
 # libhybris + Zink backend
 
-**Status:** implemented end-to-end as the `LIBHYBRIS_ZINK` graphics
-backend (`libhybris-zink` wire key). All the in-tree plumbing works:
-the patched Mesa loads, the env routing reaches Zink, libhybris's
-Vulkan is dlopened. **Currently blocked on hardware** — every Adreno
-device we have access to ships a Vulkan 1.1 vendor driver, and Zink
-requires `VK_KHR_dynamic_rendering` (a Vulkan 1.3 promotion). Will
-"just work" on devices whose vendor driver exposes Vulkan 1.3+; until
-then, Zink fails to init at the physical-device feature gate and Mesa
-silently falls back to llvmpipe. The integration test
-(`tests/integration/tests/libhybris_zink.rs::test_eglinfo_reports_zink_renderer`)
-is the tripwire — it'll flip to passing the day a device with newer
-Adreno lands.
+**Status (2026-10, Honor MagicPad 3 Pro / YLP-W00, Snapdragon 8 Elite
+Gen 5, Adreno 840):** the backend builds and runs end to end on hardware
+that exposes Vulkan 1.3+. The device reports `debug.vulkan.api.version`
+1.4 and `eglinfo`/`glmark2` show `zink Vulkan 1.4(Adreno (TM) 840)` with
+desktop OpenGL 4.6 and GLES 3.2. **On-screen presentation is still black**:
+the compositor receives and imports the client's AHardwareBuffer and builds
+the render element (verified with bounded on-device toasts), but the buffer
+contains no pixels — zink's Vulkan swapchain images never receive the
+rendered frame through libhybris' vendor-driver WSI. See "Vendor-driver WSI
+vs Turnip" below.
+
+Getting this far needed two fixes outside Mesa's own zink code:
+
+1. **Platform libc++ for libhybris.** Android 15+ ships a vendor
+   `libc++.so` that predates `std::__1::__hash_memory`, which the platform
+   `libEGL.so` / `libvulkan.so` / `liblog.so` are relocated against.
+   libhybris' built-in search order picks `/vendor/lib64` first, so EGL and
+   Vulkan failed with `cannot locate symbol
+   _ZNSt3__113__hash_memoryEPKvm`. `RootfsEnv.kt` now sets
+   `HYBRIS_LD_LIBRARY_PATH=/system/lib64:/vendor/lib64`; vendor-only libs
+   (the Adreno driver) still resolve from `/vendor`. This also fixed the
+   long-standing Firefox SIGSEGV on startup.
+2. **Mesa build fixes** (`deps/mesa-patches/mesa/07-tawc-zink-wayland-fixes.patch`).
+   Mesa 25.3 only builds `gallium/targets/dril` when `glx=dri` or an
+   X11/XCB platform is enabled, so wayland-only builds shipped no
+   `dri/zink_dri.so`. And the wayland swrast fallback never sees
+   `Options.Zink` from `MESA_LOADER_DRIVER_OVERRIDE=zink`, so it either
+   bails out or tries to load the unbuilt `swrast_dri.so`. The patch builds
+   dril when `with_dri2` is set and forces `Options.Zink` (this build only
+   has zink) with `fd_render_gpu = -1`.
+
+### Vendor-driver WSI vs Turnip
+
+The remaining black screen is in presentation, not rendering: `zink` renders
+into swapchain images handed out by libhybris' Wayland Vulkan WSI, which
+wraps the vendor (Adreno) Vulkan driver's `vkQueuePresentKHR` in an
+`ANativeWindow` and attaches the result through `android_wlegl`. Native
+Vulkan clients (`vkcube`) present correctly through the same path, so the
+compositor-side import and sampling are fine; zink's images are simply
+empty.
+
+The ARLinux project (see [arlinux.md](arlinux.md)) avoids this by not
+using the vendor driver at all: it builds Mesa with
+`-Dvulkan-drivers=freedreno -Dfreedreno-kmds=kgsl` (Turnip talking to
+`/dev/kgsl-3d0`) plus a custom `-Darlinux-wsi=true` Mesa WSI that allocates
+Qualcomm gralloc buffers, imports them into Turnip, and presents them via
+`android_wlegl` — i.e. a proper Vulkan WSI inside Mesa instead of the
+vendor-driver wrapper. `/dev/kgsl-3d0` is world-writable on this device and
+opens from the app uid, so that path is viable here and is the most
+promising way to finish zink presentation.
 
 Hands the chroot the distro's own libglvnd-fronted libGL/libGLES, with
 **our patched Mesa** (`deps/mesa-patches/mesa/06-tawc-zink-nokms.patch`)
