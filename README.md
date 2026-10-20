@@ -1,6 +1,52 @@
 # Tess's Android Wayland Compositor
 TAWC runs CLI and graphical Linux programs on Android without root. Graphical apps get hardware acceleration with the phone's native graphics stack. The project consists of tawcroot (a performant alternative to PRoot), a Wayland compositor, and the UI to put it all together.
 
+## This fork (MagicPad 3 Pro)
+
+Fork of upstream TAWC with two additions aimed at the Honor MagicPad 3 Pro
+(a Chinese tablet with a detachable keyboard/touchpad):
+
+- **Touchpad two-finger scrolling.** The compositor accepts
+  `SOURCE_TOUCHPAD` (upstream only handled `SOURCE_MOUSE`), captures the
+  relative pointer while a touchpad gesture is active, and draws a cursor
+  overlay, so clients such as Firefox scroll properly from the touchpad.
+- **Physical-keyboard Chinese input.** The compositor implements its side of
+  `zwp_input_method_v2` (plus `zwp_virtual_keyboard_v1`), so `fcitx5`
+  running inside the distro can compose for Wayland clients. The candidate
+  window is rendered above all windows, anchored just below the text caret.
+  See [notes/text-input.md](notes/text-input.md) for the design.
+
+### Using fcitx5 inside the distro
+
+```bash
+sudo pacman -S fcitx5 fcitx5-chinese-addons
+
+mkdir -p ~/.config/fcitx5
+cat > ~/.config/fcitx5/profile <<'PROFILE'
+[Groups/0]
+Name=Default
+Default Layout=us
+DefaultIM=pinyin
+
+[Groups/0/Items/0]
+Name=keyboard-us
+Layout=
+
+[Groups/0/Items/1]
+Name=pinyin
+Layout=
+
+[GroupOrder]
+0=Default
+PROFILE
+
+fcitx5 -d
+```
+
+`fcitx5-remote -n` prints the active input method and
+`fcitx5-remote -s pinyin` switches to pinyin explicitly. Composition
+happens inside the container; only the focused client receives the result.
+
 ## Features
 - The app embeds Termux's widget for a familiar terminal UI (the Termux app itself is not required)
 - When graphical apps are installed they can be run from TAWC's launcher menu
@@ -27,6 +73,39 @@ TAWC runs CLI and graphical Linux programs on Android without root. Graphical ap
 - Android 12+ may kill rootfs processes past ~32 (the phantom process killer); heavy parallel jobs can fail. On Android 14+, enable Developer options → "Disable child process restrictions"
 
 See [AGENTS.md](AGENTS.md) for more details.
+
+## Building this fork
+
+The toolchain is the same as upstream: JDK 21, the Android SDK with
+platform 36, build-tools 36 and NDK 27.2.12479018, and Rust with
+`cargo-ndk`. See [notes/building.md](notes/building.md) for the full list.
+
+Debug APK (the default build, installed as `me.phie.tawc.dev` next to the
+release app):
+
+```bash
+scripts/build-app.sh --abi=arm64-v8a --no-mesa
+# -> app/build/outputs/apk/debug/app-debug.apk
+```
+
+Debug APK with the plain package ID (`me.phie.tawc`). This is what the
+fork's release builds use; it can only be installed where no app signed
+with upstream's key is installed, because the signatures differ:
+
+```bash
+TAWC_PACKAGE=me.phie.tawc scripts/build-app.sh --abi=arm64-v8a --no-mesa
+```
+
+Signed release APK. Release builds use the `libhybris,cpu` graphics set by
+default and need a keystore you control. The keystore below is the fork's
+own; losing it means future releases cannot update installed copies:
+
+```bash
+KEYSTORE_PATH=~/Android/keystore.jks \
+KEYSTORE_PASS=... KEY_ALIAS=tawc-fork \
+scripts/build-release-apk.sh
+# -> app/build/outputs/apk/release/tawc-v<version>.apk
+```
 
 ## Contributing
 Issues are preferred over PRs. I welcome bug reports and feature requests, but no guarantee they can be handled on any particular timeline. If your issue has LLM-written content, please clearly mark it (ideally with what LLM wrote it), and always include a human-written description. Please include your app version, phone, Android version and distro (if relevant).
