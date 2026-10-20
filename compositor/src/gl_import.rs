@@ -4,6 +4,7 @@
 //! eglGetNativeClientBufferANDROID + eglCreateImageKHR + glEGLImageTargetTexture2DOES.
 
 use std::ffi::{c_void, CString};
+use std::sync::atomic::{AtomicU32, Ordering};
 use log::error;
 
 use smithay::backend::egl::ffi as egl_ffi;
@@ -20,6 +21,10 @@ const GL_TEXTURE_EXTERNAL_OES: u32 = 0x8D65;
 const GL_TEXTURE_MIN_FILTER: u32 = 0x2801;
 const GL_TEXTURE_MAG_FILTER: u32 = 0x2800;
 const GL_LINEAR: i32 = 0x2601;
+
+/// First few AHB texture imports are echoed as toasts (on-device diagnostics
+/// for the libhybris presentation path, where logcat is unavailable).
+static WLEGL_TEX_DIAG: AtomicU32 = AtomicU32::new(0);
 
 // Function pointer types
 type FnEglGetNativeClientBufferANDROID = unsafe extern "C" fn(*const c_void) -> *const c_void;
@@ -106,6 +111,9 @@ impl AhbTextureImporter {
         unsafe {
             let client_buffer = (self.egl_get_native_client_buffer)(ahb as *const c_void);
             if client_buffer.is_null() {
+                if WLEGL_TEX_DIAG.fetch_add(1, Ordering::Relaxed) < 4 {
+                    crate::toast_from_native("wlegl tex FAIL native-null");
+                }
                 return Err("eglGetNativeClientBufferANDROID returned null".into());
             }
             self.import_client_buffer(renderer, raw_display, client_buffer, width, height)
@@ -140,6 +148,9 @@ impl AhbTextureImporter {
         );
         if egl_image.is_null() {
             let err = egl_ffi::egl::GetError();
+            if WLEGL_TEX_DIAG.fetch_add(1, Ordering::Relaxed) < 4 {
+                crate::toast_from_native(&format!("wlegl tex FAIL egl 0x{err:X}"));
+            }
             return Err(format!("eglCreateImageKHR failed, EGL error: 0x{:X}", err));
         }
 
@@ -156,6 +167,9 @@ impl AhbTextureImporter {
         let gl_err = (self.gl_get_error)();
         if gl_err != 0 {
             egl_ffi::egl::DestroyImageKHR(raw_display, egl_image);
+            if WLEGL_TEX_DIAG.fetch_add(1, Ordering::Relaxed) < 4 {
+                crate::toast_from_native(&format!("wlegl tex FAIL gl 0x{gl_err:X}"));
+            }
             error!("GL error after EGLImageTargetTexture2DOES: 0x{:X}", gl_err);
             return Err(format!("glEGLImageTargetTexture2DOES failed: GL error 0x{:X}", gl_err));
         }
@@ -167,6 +181,10 @@ impl AhbTextureImporter {
         (self.gl_tex_parameteri)(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         (self.gl_tex_parameteri)(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         (self.gl_bind_texture)(GL_TEXTURE_EXTERNAL_OES, 0);
+
+        if WLEGL_TEX_DIAG.fetch_add(1, Ordering::Relaxed) < 4 {
+            crate::toast_from_native(&format!("wlegl tex ok {width}x{height}"));
+        }
 
         let size = Size::from((width, height));
         let texture = GlesTexture::from_raw_with_flags(

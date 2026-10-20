@@ -5,7 +5,7 @@
 //! turns that protocol state into pixels.
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use log::{error, info};
@@ -724,6 +724,16 @@ pub fn render_frame(
                     Scale::from(scale.fractional() * placement.scale),
                     1.0,
                 );
+            {
+                static WIN_DIAG: AtomicU32 = AtomicU32::new(0);
+                if WIN_DIAG.fetch_add(1, Ordering::Relaxed) < 8 {
+                    crate::toast_from_native(&format!(
+                        "win {i} elems {} scale={:.2}",
+                        surfaces.len(),
+                        placement.scale
+                    ));
+                }
+            }
             elements.extend(surfaces.into_iter().map(|surface| {
                 TawcRenderElement::Wayland(wrap_wayland_render_element(
                     surface,

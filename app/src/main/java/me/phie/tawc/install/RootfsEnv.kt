@@ -94,6 +94,14 @@ internal object RootfsEnv {
                 // already point at where [LibhybrisInstallProvider] copies the
                 // plugin tree. Build-time bake > per-entry env override.
                 put("HYBRIS_EGLPLATFORM", "wayland")
+                // Android 15+ still ships a vendor libc++.so that predates
+                // `std::__1::__hash_memory`, which the platform libs in
+                // /system/lib64 (libEGL, libvulkan, liblog) are relocated
+                // against. libhybris' built-in search order puts /vendor
+                // first, so both EGL and Vulkan fail with "cannot locate
+                // symbol _ZNSt3__113__hash_memoryEPKvm". Prefer the platform
+                // directory; vendor-only libs still resolve from /vendor.
+                put("HYBRIS_LD_LIBRARY_PATH", "/system/lib64:/vendor/lib64")
                 // GTK uses libhybris GLES (→ AHB) instead of falling back to
                 // its software/cairo path (→ wl_shm, optionally magenta-tinted —
                 // see Settings.tintBuffersByType). See
@@ -153,6 +161,10 @@ internal object RootfsEnv {
                 // /dev/dri/* first and falls back to llvmpipe when nothing
                 // matches — never reaching Zink.
                 put("MESA_LOADER_DRIVER_OVERRIDE", "zink")
+                // Same vendor-vs-platform libc++ ordering problem as the
+                // LIBHYBRIS branch: libhybris' libvulkan is relocated
+                // against std::__1::__hash_memory from the platform libc++.
+                put("HYBRIS_LD_LIBRARY_PATH", "/system/lib64:/vendor/lib64")
                 // Libglvnd's libEGL otherwise hits libhybris's vendor JSON
                 // (00_libhybris.json) before Mesa's (50_mesa.json) and
                 // dispatches EGL straight to libhybris's GLES-only libEGL,

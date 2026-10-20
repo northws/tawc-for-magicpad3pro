@@ -1,0 +1,46 @@
+From: tawc-fork
+Origin: own
+
+meson: build gallium/targets/dril for wayland-only builds too.
+
+Mesa 25.3 only builds the DRI megadriver (libdril_dri.so, which zink_dri.so
+links to) when glx=dri or an X11/XCB platform is enabled. tawc builds Mesa
+with platforms=wayland and glx=disabled, which used to leave the
+mesa-zink asset set without any dri/ directory, so EGL could not load the
+zink driver at runtime. Also build it when dri2 is enabled.
+
+diff --git a/src/meson.build b/src/meson.build
+index fdfb2dc246f..ea822266612 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -101,10 +101,17 @@ endif
+ if with_gfxstream_vk
+   dep_virtgpu_kumquat_ffi = null_dep
+   if with_virtgpu_kumquat
+-    subdir('util/rust')
+-    subdir('virtio/protocols')
+-    subdir('virtio/virtgpu_kumquat')
+-    subdir('virtio/virtgpu_kumquat_ffi')
++    if get_option('virtgpu_kumquat_external_ffi')
++      # Static lib + header come from a separate cargo build — see
++      # deps/mesa-patches/mesa/02-meson-external-kumquat-ffi.patch and
++      # scripts/build-mesa-gfxstream.sh.
++      dep_virtgpu_kumquat_ffi = dependency('virtgpu_kumquat_ffi')
++    else
++      subdir('util/rust')
++      subdir('virtio/protocols')
++      subdir('virtio/virtgpu_kumquat')
++      subdir('virtio/virtgpu_kumquat_ffi')
++    endif
+   endif
+   subdir('gfxstream')
+ endif
+@@ -148,7 +155,7 @@ if with_egl
+   subdir('egl')
+ endif
+ if with_gallium and with_gbm
+-  if with_glx == 'dri' or with_platform_x11 or with_platform_xcb
++  if with_glx == 'dri' or with_platform_x11 or with_platform_xcb or with_dri2
+     subdir('gallium/targets/dril')
+   endif
+ endif

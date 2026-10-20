@@ -17,6 +17,9 @@ use std::ptr;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
+static WLEGL_AHB_DIAG: AtomicU32 = AtomicU32::new(0);
+static WLEGL_IMPORT_DIAG: AtomicU32 = AtomicU32::new(0);
+
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::{ExternalBuffer, ExternalBufferData, ExternalBufferImportError};
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
@@ -210,15 +213,23 @@ impl ExternalBuffer for WleglBufferData {
         _damage: &[Rectangle<i32, BufferCoord>],
     ) -> Option<Result<GlesTexture, ExternalBufferImportError>> {
         if let Some(texture) = self.texture.lock().unwrap().clone() {
+            if WLEGL_IMPORT_DIAG.fetch_add(1, Ordering::Relaxed) < 10 {
+                crate::toast_from_native(&format!(
+                    "wlegl import cache {}x{}",
+                    self.width, self.height
+                ));
+            }
             return Some(Ok(texture));
         }
 
         let texture = (|| {
             unsafe {
-                renderer
-                    .egl_context()
-                    .make_current()
-                    .map_err(|err| -> ExternalBufferImportError { Box::new(err) })?;
+                renderer.egl_context().make_current().map_err(
+                    |err| -> ExternalBufferImportError {
+                        crate::toast_from_native("wlegl tex FAIL make_current");
+                        Box::new(err)
+                    },
+                )?;
             }
             let display = renderer.egl_context().display().get_display_handle();
             self.importer
@@ -233,6 +244,12 @@ impl ExternalBuffer for WleglBufferData {
         };
         *self.texture.lock().unwrap() = Some(texture.clone());
         WLEGL_IMPORT_TEXTURE_TOTAL.fetch_add(1, Ordering::Relaxed);
+        if WLEGL_IMPORT_DIAG.fetch_add(1, Ordering::Relaxed) < 10 {
+            crate::toast_from_native(&format!(
+                "wlegl import fresh {}x{}",
+                self.width, self.height
+            ));
+        }
         Some(Ok(texture))
     }
 }
@@ -389,6 +406,12 @@ impl Dispatch<AndroidWlegl, ()> for TawcState {
                     std::mem::forget(fd);
                 }
                 drop(inner);
+
+                if WLEGL_AHB_DIAG.fetch_add(1, Ordering::Relaxed) < 4 {
+                    crate::toast_from_native(&format!(
+                        "wlegl AHB {w_u}x{h_u} fmt={fmt_u:x} usage={usage_u64:x}"
+                    ));
+                }
 
                 let data = WleglBufferData {
                     ahb,

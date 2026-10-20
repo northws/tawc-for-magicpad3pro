@@ -1131,6 +1131,29 @@ impl CompositorHandler for TawcState {
         self.needs_render = true;
         self.frame_callbacks_pending = true;
 
+        // On-device diagnostic: which buffer kind do clients actually
+        // present? (logcat is unavailable on this device.)
+        {
+            static BUF_DIAG: AtomicU32 = AtomicU32::new(0);
+            let buffer = with_renderer_surface_state(surface, |renderer_state| {
+                renderer_state.buffer().cloned()
+            })
+            .flatten();
+            if let Some(buffer) = buffer {
+                let n = BUF_DIAG.fetch_add(1, Ordering::Relaxed);
+                if n < 8 {
+                    let kind = if wlegl::wlegl_buffer_data(&buffer).is_some() {
+                        "wlegl"
+                    } else if matches!(buffer_type(&buffer), Some(BufferType::Shm)) {
+                        "shm"
+                    } else {
+                        "other"
+                    };
+                    crate::toast_from_native(&format!("buf {kind}"));
+                }
+            }
+        }
+
         crate::cursor::after_commit(self, surface);
     }
 }
