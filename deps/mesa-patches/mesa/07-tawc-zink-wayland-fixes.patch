@@ -1,0 +1,45 @@
+From: tawc-fork
+Origin: own
+
+EGL Wayland: force zink in the no-DRM fallback and build dril on wayland-only builds.
+
+--- a/src/egl/drivers/dri2/platform_wayland.c
++++ b/src/egl/drivers/dri2/platform_wayland.c
+@@ -3251,8 +3251,10 @@
+ EGLBoolean
+ dri2_initialize_wayland(_EGLDisplay *disp)
+ {
+-   if (disp->Options.ForceSoftware)
++   if (disp->Options.ForceSoftware) {
++      disp->Options.Zink = EGL_TRUE;
+       return dri2_initialize_wayland_swrast(disp);
++   }
+    if (dri2_initialize_wayland_drm(disp))
+       return EGL_TRUE;
+    /* tawc-fork: with MESA_LOADER_DRIVER_OVERRIDE=zink, the DRM init
+@@ -3264,11 +3266,9 @@
+     * driCreateNewScreen3 (Kopper takes the no-DRM path with -1; with
+     * the calloc default of 0 it would do DRM ioctls on stdin). Same
+     * trick `surfaceless_probe_device_sw` uses upstream. */
+-   if (disp->Options.Zink) {
+-      dri2_egl_display(disp)->fd_render_gpu = -1;
+-      return dri2_initialize_wayland_swrast(disp);
+-   }
+-   return EGL_FALSE;
++   disp->Options.Zink = EGL_TRUE;
++   dri2_egl_display(disp)->fd_render_gpu = -1;
++   return dri2_initialize_wayland_swrast(disp);
+ }
+ 
+ void
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -155,7 +155,7 @@
+   subdir('egl')
+ endif
+ if with_gallium and with_gbm
+-  if with_glx == 'dri' or with_platform_x11 or with_platform_xcb
++  if with_glx == 'dri' or with_platform_x11 or with_platform_xcb or with_dri2
+     subdir('gallium/targets/dril')
+   endif
+ endif
